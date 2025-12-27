@@ -109,7 +109,7 @@ class SymbolManager {
       console.log(`[SYMBOLS] Active: ${count} | Filtered: ${filtered}`);
       
       if (CONFIG.MIN_24H_VOLUME > 0) {
-        console.log(`[SYMBOLS] Filter: 24h volume > $${(CONFIG.MIN_24H_VOLUME / 1e6).toFixed(1)}M`);
+        console.log(`[SYMBOLS] Filter: 24h volume > ${(CONFIG.MIN_24H_VOLUME / 1e6).toFixed(1)}M`);
       }
       
       if (CONFIG.BLACKLIST.length > 0) {
@@ -119,9 +119,54 @@ class SymbolManager {
       return Array.from(this.symbols);
       
     } catch (error) {
-      console.error('[SYMBOLS] Error:', error.message);
+      console.error('[SYMBOLS] API Error:', error.message);
+      
+      // FALLBACK: Use hardcoded top symbols if API fails (geo-blocking)
+      if (error.response?.status === 451 || error.code === 'ECONNREFUSED') {
+        console.log('[SYMBOLS] ⚠️  Geo-blocked or connection failed - using fallback list');
+        return this.useFallbackSymbols();
+      }
+      
       return [];
     }
+  }
+
+  useFallbackSymbols() {
+    // Top 100 USDT perpetuals by typical volume
+    const fallbackList = [
+      'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+      'ADAUSDT', 'DOGEUSDT', 'DOTUSDT', 'MATICUSDT', 'SHIBUSDT',
+      'AVAXUSDT', 'LTCUSDT', 'TRXUSDT', 'UNIUSDT', 'LINKUSDT',
+      'ATOMUSDT', 'ETCUSDT', 'XLMUSDT', 'NEARUSDT', 'APTUSDT',
+      'FILUSDT', 'LDOUSDT', 'ARBUSDT', 'OPUSDT', 'RUNEUSDT',
+      'INJUSDT', 'SUIUSDT', 'SEIUSDT', 'TIAUSDT', 'WLDUSDT',
+      'PEPEUSDT', 'RENDERUSDT', 'FETUSDT', 'TAOUSDT', 'GRTUSDT',
+      'ICPUSDT', 'AAVEUSDT', 'MKRUSDT', 'FTMUSDT', 'ALGOUSDT',
+      'SANDUSDT', 'MANAUSDT', 'AXSUSDT', 'THETAUSDT', 'EGLDUSDT',
+      'ARUSDT', 'ZECUSDT', 'COMPUSDT', 'SNXUSDT', 'APEUSDT',
+      'GALAUSDT', 'CHZUSDT', 'ENJUSDT', 'IMXUSDT', 'BLURUSDT',
+      'GMXUSDT', 'CRVUSDT', 'ILVUSDT', 'STXUSDT', 'BLURUSDT',
+      'PENDLEUSDT', 'JUPUSDT', 'PYTHUSDT', 'WIFUSDT', 'BONKUSDT',
+      'ORDIUSDT', 'SATSUSDT', 'RATSUSDT', '1000PEPEUSDT', 'FLOKIUSDT',
+      'ONDOUSDT', 'DYMUSDT', 'PIXELUSDT', 'STRKUSDT', 'PORTALUSDT',
+      'ACEUSDT', 'NFPUSDT', 'AIUSDT', 'XAIUSDT', 'MANTAUSDT',
+      'ALTUSDT', 'JUPUSDT', 'PYTHUSDT', 'RONINUSDT', 'DYMUSDT',
+      'PIXELUSDT', 'STRKUSDT', 'PORTALUSDT', 'PDAUSDT', 'BOMEUSDT',
+      'ETHFIUSDT', 'ENAUSDT', 'WUSDT', 'TNSRUSDT', 'SAGAUSDT',
+      'OMNIUSDT', 'REZUSDT', 'BBUSDT', 'NOTUSDT', 'IOUSDT'
+    ];
+    
+    fallbackList.forEach(symbol => {
+      if (!CONFIG.BLACKLIST.includes(symbol)) {
+        this.symbols.add(symbol);
+        this.volumeData.set(symbol, 10_000_000); // Mock volume
+      }
+    });
+    
+    console.log(`[SYMBOLS] Loaded ${this.symbols.size} symbols from fallback list`);
+    console.log('[SYMBOLS] 💡 For live data, deploy to non-blocked region or use proxy');
+    
+    return Array.from(this.symbols);
   }
 
   isActive(symbol) {
