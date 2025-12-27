@@ -1,0 +1,55 @@
+{
+  "name": "mexc-liquidation-bot",
+  "version": "1.0.0",
+  "description": "MEXC Futures Liquidation Alert Bot - Real-time liquidation monitoring with Telegram alerts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "node test.js",
+    "test:telegram": "node -e \"require('./test.js').testTelegram()\"",
+    "test:websocket": "node -e \"require('./test.js').testWebSocket()\"",
+    "test:volume": "node -e \"new (require('./test.js').VolumeAggregatorTest)().runAllTests()\"",
+    "simulate": "node -e \"require('./test.js').simulateLiquidationEvent()\"",
+    "debug": "node -e \"new (require('./test.js').DebugBot)().start()\"",
+    "performance": "node -e \"require('./test.js').performanceTest()\"",
+    "pm2:start": "pm2 start index.js --name mexc-bot",
+    "pm2:stop": "pm2 stop mexc-bot",
+    "pm2:restart": "pm2 restart mexc-bot",
+    "pm2:logs": "pm2 logs mexc-bot",
+    "pm2:status": "pm2 status"
+  },
+  "keywords": [
+    "mexc",
+    "liquidation",
+    "trading",
+    "bot",
+    "telegram",
+    "futures",
+    "crypto",
+    "alerts"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/mexc-liquidation-bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/mexc-liquidation-bot/issues"
+  },
+  "homepage": "https://github.com/yourusername/mexc-liquidation-bot#readme"
+}
