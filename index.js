@@ -1,20 +1,6 @@
 // ============================================================================
-// BINANCE FUTURES AGGRESSIVE FLOW MONITOR
-// Real-time detection of forced market movements via aggressive trade flow
-// ============================================================================
-//
-// ARCHITECTURE PRINCIPLES:
-// 1. Single WebSocket stream (!aggTrade@arr) - all USDT perpetuals
-// 2. Rolling window aggregation per symbol
-// 3. Signal detection based on volume dominance + price impulse
-// 4. Zero duplicate alerts via cooldown system
-// 5. Memory-efficient per-symbol state management
-//
-// WHY THIS APPROACH:
-// - Binance provides excellent global agg trade stream
-// - No need for individual subscriptions (scales to 1000+ symbols)
-// - Real aggressive flow = better signal than liquidation events
-// - REST only for symbol initialization, not hot path
+// BINANCE FUTURES AGGRESSIVE FLOW MONITOR (VPN-Ready)
+// Real-time detection via individual symbol streams (works globally)
 // ============================================================================
 
 if (process.env.NODE_ENV !== 'production') {
@@ -32,24 +18,22 @@ const axios = require('axios');
 const CONFIG = {
   // Signal thresholds
   MIN_VOLUME_USD: parseFloat(process.env.MIN_VOLUME_USD) || 300_000,
-  MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 70.0,
+  MIN_DOMINANCE: parseFloat(process.env.MIN_DOMINANCE) || 65.0,
   MIN_PRICE_CHANGE: parseFloat(process.env.MIN_PRICE_CHANGE) || 0.3,
   
   // Time windows
   WINDOW_SECONDS: parseInt(process.env.WINDOW_SECONDS) || 180,
   COOLDOWN_MINUTES: parseInt(process.env.COOLDOWN_MINUTES) || 15,
   
-  // Optional filters
-  MIN_24H_VOLUME: parseFloat(process.env.MIN_24H_VOLUME) || 0, // 0 = disabled
-  BLACKLIST: (process.env.BLACKLIST || '').split(',').filter(Boolean),
+  // Symbols (manual list - no API needed)
+  SYMBOLS: (process.env.SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,DOTUSDT,MATICUSDT,LINKUSDT,LTCUSDT,UNIUSDT,ATOMUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,INJUSDT,SEIUSDT,TIAUSDT,PEPEUSDT,WLDUSDT,RENDERUSDT,FETUSDT,TAOUSDT,ORDIUSDT,STXUSDT,MANTAUSDT').split(','),
   
   // System
-  STATS_LOG_INTERVAL: parseInt(process.env.STATS_LOG_INTERVAL) || 60, // seconds
-  SYMBOL_REFRESH_HOURS: parseInt(process.env.SYMBOL_REFRESH_HOURS) || 4,
+  STATS_LOG_INTERVAL: parseInt(process.env.STATS_LOG_INTERVAL) || 60,
+  MAX_RECONNECTS: parseInt(process.env.MAX_RECONNECTS) || 10,
   
-  // Binance
-  BINANCE_WS: 'wss://fstream.binance.com/stream',
-  BINANCE_API: 'https://fapi.binance.com',
+  // Binance - DIRECT connection (no /stream path)
+  BINANCE_WS: 'wss://fstream.binance.com/ws',
   
   // Telegram
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
@@ -57,141 +41,14 @@ const CONFIG = {
 };
 
 // ============================================================================
-// SYMBOL MANAGER
-// ============================================================================
-// Manages active symbols and optional 24h volume filtering
-
-class SymbolManager {
-  constructor() {
-    this.symbols = new Set();
-    this.volumeData = new Map(); // symbol -> 24h volume
-  }
-
-  async initialize() {
-    console.log('[SYMBOLS] Fetching Binance Futures symbols...');
-    
-    try {
-      const response = await axios.get(`${CONFIG.BINANCE_API}/fapi/v1/ticker/24hr`, {
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      });
-
-      let count = 0;
-      let filtered = 0;
-
-      for (const ticker of response.data) {
-        const symbol = ticker.symbol;
-        
-        // Only USDT perpetuals
-        if (!symbol.endsWith('USDT')) continue;
-        
-        // Blacklist check
-        if (CONFIG.BLACKLIST.includes(symbol)) {
-          filtered++;
-          continue;
-        }
-        
-        const volume24h = parseFloat(ticker.quoteVolume) || 0;
-        
-        // Optional volume filter
-        if (CONFIG.MIN_24H_VOLUME > 0 && volume24h < CONFIG.MIN_24H_VOLUME) {
-          filtered++;
-          continue;
-        }
-        
-        this.symbols.add(symbol);
-        this.volumeData.set(symbol, volume24h);
-        count++;
-      }
-
-      console.log(`[SYMBOLS] Active: ${count} | Filtered: ${filtered}`);
-      
-      if (CONFIG.MIN_24H_VOLUME > 0) {
-        console.log(`[SYMBOLS] Filter: 24h volume > ${(CONFIG.MIN_24H_VOLUME / 1e6).toFixed(1)}M`);
-      }
-      
-      if (CONFIG.BLACKLIST.length > 0) {
-        console.log(`[SYMBOLS] Blacklisted: ${CONFIG.BLACKLIST.join(', ')}`);
-      }
-
-      return Array.from(this.symbols);
-      
-    } catch (error) {
-      console.error('[SYMBOLS] API Error:', error.message);
-      
-      // FALLBACK: Use hardcoded top symbols if API fails (geo-blocking)
-      if (error.response?.status === 451 || error.code === 'ECONNREFUSED') {
-        console.log('[SYMBOLS] ⚠️  Geo-blocked or connection failed - using fallback list');
-        return this.useFallbackSymbols();
-      }
-      
-      return [];
-    }
-  }
-
-  useFallbackSymbols() {
-    // Top 100 USDT perpetuals by typical volume
-    const fallbackList = [
-      'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-      'ADAUSDT', 'DOGEUSDT', 'DOTUSDT', 'MATICUSDT', 'SHIBUSDT',
-      'AVAXUSDT', 'LTCUSDT', 'TRXUSDT', 'UNIUSDT', 'LINKUSDT',
-      'ATOMUSDT', 'ETCUSDT', 'XLMUSDT', 'NEARUSDT', 'APTUSDT',
-      'FILUSDT', 'LDOUSDT', 'ARBUSDT', 'OPUSDT', 'RUNEUSDT',
-      'INJUSDT', 'SUIUSDT', 'SEIUSDT', 'TIAUSDT', 'WLDUSDT',
-      'PEPEUSDT', 'RENDERUSDT', 'FETUSDT', 'TAOUSDT', 'GRTUSDT',
-      'ICPUSDT', 'AAVEUSDT', 'MKRUSDT', 'FTMUSDT', 'ALGOUSDT',
-      'SANDUSDT', 'MANAUSDT', 'AXSUSDT', 'THETAUSDT', 'EGLDUSDT',
-      'ARUSDT', 'ZECUSDT', 'COMPUSDT', 'SNXUSDT', 'APEUSDT',
-      'GALAUSDT', 'CHZUSDT', 'ENJUSDT', 'IMXUSDT', 'BLURUSDT',
-      'GMXUSDT', 'CRVUSDT', 'ILVUSDT', 'STXUSDT', 'BLURUSDT',
-      'PENDLEUSDT', 'JUPUSDT', 'PYTHUSDT', 'WIFUSDT', 'BONKUSDT',
-      'ORDIUSDT', 'SATSUSDT', 'RATSUSDT', '1000PEPEUSDT', 'FLOKIUSDT',
-      'ONDOUSDT', 'DYMUSDT', 'PIXELUSDT', 'STRKUSDT', 'PORTALUSDT',
-      'ACEUSDT', 'NFPUSDT', 'AIUSDT', 'XAIUSDT', 'MANTAUSDT',
-      'ALTUSDT', 'JUPUSDT', 'PYTHUSDT', 'RONINUSDT', 'DYMUSDT',
-      'PIXELUSDT', 'STRKUSDT', 'PORTALUSDT', 'PDAUSDT', 'BOMEUSDT',
-      'ETHFIUSDT', 'ENAUSDT', 'WUSDT', 'TNSRUSDT', 'SAGAUSDT',
-      'OMNIUSDT', 'REZUSDT', 'BBUSDT', 'NOTUSDT', 'IOUSDT'
-    ];
-    
-    fallbackList.forEach(symbol => {
-      if (!CONFIG.BLACKLIST.includes(symbol)) {
-        this.symbols.add(symbol);
-        this.volumeData.set(symbol, 10_000_000); // Mock volume
-      }
-    });
-    
-    console.log(`[SYMBOLS] Loaded ${this.symbols.size} symbols from fallback list`);
-    console.log('[SYMBOLS] 💡 For live data, deploy to non-blocked region or use proxy');
-    
-    return Array.from(this.symbols);
-  }
-
-  isActive(symbol) {
-    return this.symbols.has(symbol);
-  }
-
-  getVolume24h(symbol) {
-    return this.volumeData.get(symbol) || 0;
-  }
-
-  getCount() {
-    return this.symbols.size;
-  }
-}
-
-// ============================================================================
 // SYMBOL STATE
 // ============================================================================
-// Per-symbol rolling window state
 
 class SymbolState {
   constructor(symbol, windowSeconds) {
     this.symbol = symbol;
     this.windowMs = windowSeconds * 1000;
-    this.trades = []; // [{timestamp, price, buyVol, sellVol}]
+    this.trades = [];
     this.firstPrice = null;
     this.lastPrice = null;
   }
@@ -202,8 +59,8 @@ class SymbolState {
     const trade = {
       timestamp,
       price,
-      buyVol: isBuyerMaker ? 0 : volume,  // buyer = taker buy (aggressive buy)
-      sellVol: isBuyerMaker ? volume : 0   // seller = taker sell (aggressive sell)
+      buyVol: isBuyerMaker ? 0 : volume,
+      sellVol: isBuyerMaker ? volume : 0
     };
 
     this.trades.push(trade);
@@ -218,20 +75,8 @@ class SymbolState {
 
   cleanup(currentTime) {
     const cutoff = currentTime - this.windowMs;
-    
-    let firstValidIdx = 0;
-    for (let i = 0; i < this.trades.length; i++) {
-      if (this.trades[i].timestamp >= cutoff) {
-        firstValidIdx = i;
-        break;
-      }
-    }
+    this.trades = this.trades.filter(t => t.timestamp >= cutoff);
 
-    if (firstValidIdx > 0) {
-      this.trades = this.trades.slice(firstValidIdx);
-    }
-
-    // Update first price
     if (this.trades.length > 0) {
       this.firstPrice = this.trades[0].price;
     } else {
@@ -283,28 +128,22 @@ class SymbolState {
     this.firstPrice = null;
     this.lastPrice = null;
   }
-
-  getMemorySize() {
-    return this.trades.length;
-  }
 }
 
 // ============================================================================
 // TRADE AGGREGATOR
 // ============================================================================
-// Manages all symbol states and provides aggregated stats
 
 class TradeAggregator {
   constructor(windowSeconds) {
     this.windowSeconds = windowSeconds;
-    this.states = new Map(); // symbol -> SymbolState
+    this.states = new Map();
   }
 
   addTrade(symbol, timestamp, price, quantity, isBuyerMaker) {
     if (!this.states.has(symbol)) {
       this.states.set(symbol, new SymbolState(symbol, this.windowSeconds));
     }
-
     this.states.get(symbol).addTrade(timestamp, price, quantity, isBuyerMaker);
   }
 
@@ -315,86 +154,52 @@ class TradeAggregator {
 
   resetSymbol(symbol) {
     const state = this.states.get(symbol);
-    if (state) {
-      state.reset();
-    }
+    if (state) state.reset();
   }
 
-  getActiveSymbolCount() {
+  getActiveCount() {
     return this.states.size;
   }
 
-  getTotalTradeCount() {
+  getTotalTrades() {
     let total = 0;
     for (const state of this.states.values()) {
-      total += state.getMemorySize();
+      total += state.trades.length;
     }
     return total;
-  }
-
-  cleanup() {
-    // Remove empty states to prevent memory leak
-    for (const [symbol, state] of this.states.entries()) {
-      if (state.getMemorySize() === 0) {
-        this.states.delete(symbol);
-      }
-    }
   }
 }
 
 // ============================================================================
 // SIGNAL ENGINE
 // ============================================================================
-// Detects tradeable signals based on configurable criteria
 
 class SignalEngine {
   shouldAlert(stats) {
     if (!stats) return false;
-
-    // Volume threshold
-    if (stats.totalVolume < CONFIG.MIN_VOLUME_USD) {
-      return false;
-    }
-
-    // Dominance threshold
-    if (stats.dominance < CONFIG.MIN_DOMINANCE) {
-      return false;
-    }
-
-    // Price change threshold
-    if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE) {
-      return false;
-    }
-
-    // Direction alignment: buy dominance should = price up (and vice versa)
-    if (stats.dominantSide === 'buy' && stats.priceChange < 0) {
-      return false;
-    }
+    if (stats.totalVolume < CONFIG.MIN_VOLUME_USD) return false;
+    if (stats.dominance < CONFIG.MIN_DOMINANCE) return false;
+    if (Math.abs(stats.priceChange) < CONFIG.MIN_PRICE_CHANGE) return false;
     
-    if (stats.dominantSide === 'sell' && stats.priceChange > 0) {
-      return false;
-    }
+    // Direction alignment
+    if (stats.dominantSide === 'buy' && stats.priceChange < 0) return false;
+    if (stats.dominantSide === 'sell' && stats.priceChange > 0) return false;
 
     return true;
   }
 
   interpretSignal(stats) {
-    // Buy dominance = shorts forced to cover (aggressive buying)
-    // Sell dominance = longs forced to close (aggressive selling)
-    
     if (stats.dominantSide === 'buy') {
       return {
         type: 'SHORT SQUEEZE',
         emoji: '🟢',
-        direction: 'UP',
-        liquidatedSide: 'shorts'
+        direction: 'UP'
       };
     } else {
       return {
         type: 'LONG FLUSH',
         emoji: '🔴',
-        direction: 'DOWN',
-        liquidatedSide: 'longs'
+        direction: 'DOWN'
       };
     }
   }
@@ -403,28 +208,22 @@ class SignalEngine {
 // ============================================================================
 // COOLDOWN MANAGER
 // ============================================================================
-// Prevents duplicate alerts for same symbol
 
 class CooldownManager {
   constructor(cooldownMinutes) {
-    this.cooldowns = new Map(); // symbol -> {timestamp, side, volume}
+    this.cooldowns = new Map();
     this.cooldownMs = cooldownMinutes * 60 * 1000;
   }
 
   canAlert(symbol, stats) {
-    if (!this.cooldowns.has(symbol)) {
-      return true;
-    }
+    if (!this.cooldowns.has(symbol)) return true;
 
-    const lastAlert = this.cooldowns.get(symbol);
-    const elapsed = Date.now() - lastAlert.timestamp;
+    const last = this.cooldowns.get(symbol);
+    const elapsed = Date.now() - last.timestamp;
     
-    // Cooldown not expired
     if (elapsed < this.cooldownMs) {
-      // Allow if opposite side or 2x volume
-      const oppositeSide = stats.dominantSide !== lastAlert.side;
-      const biggerVolume = stats.totalVolume / lastAlert.volume >= 2.0;
-      
+      const oppositeSide = stats.dominantSide !== last.side;
+      const biggerVolume = stats.totalVolume / last.volume >= 2.0;
       return oppositeSide || biggerVolume;
     }
 
@@ -438,21 +237,11 @@ class CooldownManager {
       volume: stats.totalVolume
     });
   }
-
-  cleanup() {
-    const now = Date.now();
-    for (const [symbol, data] of this.cooldowns.entries()) {
-      if (now - data.timestamp > this.cooldownMs * 2) {
-        this.cooldowns.delete(symbol);
-      }
-    }
-  }
 }
 
 // ============================================================================
 // ALERT MANAGER
 // ============================================================================
-// Formats and sends Telegram alerts
 
 class AlertManager {
   constructor(telegram) {
@@ -460,7 +249,7 @@ class AlertManager {
     this.alertCount = 0;
   }
 
-  async sendAlert(symbol, stats, interpretation, volume24h) {
+  async sendAlert(symbol, stats, interpretation) {
     const lines = [];
     
     lines.push(`${interpretation.emoji} ${interpretation.type}`);
@@ -479,24 +268,14 @@ class AlertManager {
     lines.push(`🟢 Aggressive Buy: $${this.fmt(stats.buyVolume)}`);
     lines.push(`🔴 Aggressive Sell: $${this.fmt(stats.sellVolume)}`);
     
-    if (volume24h > 0) {
-      lines.push(`📊 24h Volume: $${this.fmt(volume24h)}`);
-    }
-    
     const message = lines.join('\n');
     
     try {
-      await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
-      });
-      
+      await this.telegram.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message);
       this.alertCount++;
-      
       console.log(`[ALERT] ${symbol} | ${interpretation.type} | $${this.fmt(stats.totalVolume)} | ${stats.dominance.toFixed(1)}% | Δ${stats.priceChange.toFixed(2)}%`);
-      
     } catch (error) {
-      console.error(`[ALERT] Error sending for ${symbol}:`, error.message);
+      console.error(`[ALERT] Error:`, error.message);
     }
   }
 
@@ -506,119 +285,100 @@ class AlertManager {
     return num.toFixed(0);
   }
 
-  getAlertCount() {
+  getCount() {
     return this.alertCount;
   }
 }
 
 // ============================================================================
-// WEBSOCKET MANAGER
+// MULTI-WEBSOCKET MANAGER
 // ============================================================================
-// Connects to Binance global aggTrade stream
 
-class WebSocketManager {
-  constructor(symbolManager, tradeAggregator, signalEngine, cooldownManager, alertManager) {
-    this.symbolManager = symbolManager;
+class MultiWebSocketManager {
+  constructor(symbols, tradeAggregator, signalEngine, cooldownManager, alertManager) {
+    this.symbols = symbols;
     this.tradeAggregator = tradeAggregator;
     this.signalEngine = signalEngine;
     this.cooldownManager = cooldownManager;
     this.alertManager = alertManager;
     
-    this.ws = null;
-    this.reconnectAttempts = 0;
-    this.maxReconnects = 10;
-    this.reconnectDelay = 5000;
-    this.pingInterval = null;
-    
+    this.connections = new Map();
     this.tradeCount = 0;
     this.lastStatsLog = Date.now();
+    this.reconnectAttempts = new Map();
   }
 
-  connect() {
-    console.log('[WS] Connecting to Binance...');
+  connectAll() {
+    console.log(`[WS] Connecting to ${this.symbols.length} symbols...`);
     
-    // Global aggTrade stream for all symbols
-    const streamName = '!aggTrade@arr';
-    const url = `${CONFIG.BINANCE_WS}?streams=${streamName}`;
-    
-    this.ws = new WebSocket(url);
-
-    this.ws.on('open', () => {
-      console.log('[WS] Connected successfully');
-      this.reconnectAttempts = 0;
-      this.startPing();
-      console.log(`[WS] Monitoring ${this.symbolManager.getCount()} symbols`);
-      console.log(`[WS] Signal criteria: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M | ${CONFIG.MIN_DOMINANCE}% | ${CONFIG.MIN_PRICE_CHANGE}%`);
-      console.log('[WS] Listening for aggressive trades...\n');
-    });
-
-    this.ws.on('message', (data) => {
-      this.handleMessage(data);
-    });
-
-    this.ws.on('error', (error) => {
-      console.error('[WS] Error:', error.message);
-    });
-
-    this.ws.on('close', () => {
-      console.log('[WS] Connection closed');
-      this.stopPing();
-      this.reconnect();
-    });
-
-    this.ws.on('pong', () => {
-      // Connection alive
-    });
+    // Connect in batches to avoid overwhelming
+    const batchSize = 10;
+    for (let i = 0; i < this.symbols.length; i += batchSize) {
+      setTimeout(() => {
+        const batch = this.symbols.slice(i, i + batchSize);
+        batch.forEach(symbol => this.connectSymbol(symbol));
+      }, i * 100); // 100ms delay between batches
+    }
   }
 
-  handleMessage(data) {
+  connectSymbol(symbol) {
+    const streamName = `${symbol.toLowerCase()}@aggTrade`;
+    const url = `${CONFIG.BINANCE_WS}/${streamName}`;
+    
+    const ws = new WebSocket(url);
+
+    ws.on('open', () => {
+      console.log(`[WS] ${symbol} connected`);
+      this.reconnectAttempts.set(symbol, 0);
+    });
+
+    ws.on('message', (data) => {
+      this.handleMessage(symbol, data);
+    });
+
+    ws.on('error', (error) => {
+      console.error(`[WS] ${symbol} error:`, error.message);
+    });
+
+    ws.on('close', () => {
+      console.log(`[WS] ${symbol} closed`);
+      this.reconnectSymbol(symbol);
+    });
+
+    this.connections.set(symbol, ws);
+  }
+
+  handleMessage(symbol, data) {
     try {
-      const message = JSON.parse(data);
+      const trade = JSON.parse(data);
       
-      // Global stream format: {stream: "...", data: {...}}
-      if (!message.data) return;
+      // Binance aggTrade format
+      const price = parseFloat(trade.p);
+      const quantity = parseFloat(trade.q);
+      const timestamp = trade.T;
+      const isBuyerMaker = trade.m;
       
-      const trades = Array.isArray(message.data) ? message.data : [message.data];
+      this.tradeAggregator.addTrade(symbol, timestamp, price, quantity, isBuyerMaker);
+      this.tradeCount++;
       
-      for (const trade of trades) {
-        const symbol = trade.s;
-        
-        // Filter inactive symbols
-        if (!this.symbolManager.isActive(symbol)) continue;
-        
-        const price = parseFloat(trade.p);
-        const quantity = parseFloat(trade.q);
-        const timestamp = trade.T;
-        const isBuyerMaker = trade.m; // true = sell aggression, false = buy aggression
-        
-        // Add to aggregator
-        this.tradeAggregator.addTrade(symbol, timestamp, price, quantity, isBuyerMaker);
-        
-        this.tradeCount++;
-        
-        // Check for signal
-        const stats = this.tradeAggregator.getStats(symbol);
-        
-        if (stats && stats.totalVolume >= CONFIG.MIN_VOLUME_USD * 0.5) {
-          // Check if alert conditions met
-          if (this.signalEngine.shouldAlert(stats)) {
-            if (this.cooldownManager.canAlert(symbol, stats)) {
-              const interpretation = this.signalEngine.interpretSignal(stats);
-              const volume24h = this.symbolManager.getVolume24h(symbol);
-              
-              this.alertManager.sendAlert(symbol, stats, interpretation, volume24h);
-              this.cooldownManager.recordAlert(symbol, stats);
-              this.tradeAggregator.resetSymbol(symbol);
-            }
+      // Check for signal
+      const stats = this.tradeAggregator.getStats(symbol);
+      
+      if (stats && stats.totalVolume >= CONFIG.MIN_VOLUME_USD * 0.5) {
+        if (this.signalEngine.shouldAlert(stats)) {
+          if (this.cooldownManager.canAlert(symbol, stats)) {
+            const interpretation = this.signalEngine.interpretSignal(stats);
+            this.alertManager.sendAlert(symbol, stats, interpretation);
+            this.cooldownManager.recordAlert(symbol, stats);
+            this.tradeAggregator.resetSymbol(symbol);
           }
         }
       }
       
-      // Periodic stats logging
       this.logStats();
       
     } catch (error) {
-      console.error('[WS] Parse error:', error.message);
+      console.error(`[WS] ${symbol} parse error:`, error.message);
     }
   }
 
@@ -628,54 +388,38 @@ class WebSocketManager {
       return;
     }
 
-    const activeSymbols = this.tradeAggregator.getActiveSymbolCount();
-    const totalTrades = this.tradeAggregator.getTotalTradeCount();
-    const alerts = this.alertManager.getAlertCount();
+    const activeSymbols = this.tradeAggregator.getActiveCount();
+    const totalTrades = this.tradeAggregator.getTotalTrades();
+    const alerts = this.alertManager.getCount();
+    const connected = Array.from(this.connections.values()).filter(ws => ws.readyState === WebSocket.OPEN).length;
     
-    console.log(`[STATS] Active: ${activeSymbols} symbols | Trades in memory: ${totalTrades} | Alerts sent: ${alerts} | Rate: ${(this.tradeCount / CONFIG.STATS_LOG_INTERVAL).toFixed(0)} trades/s`);
+    console.log(`[STATS] Connected: ${connected}/${this.symbols.length} | Active: ${activeSymbols} | Trades: ${totalTrades} | Alerts: ${alerts} | Rate: ${(this.tradeCount / CONFIG.STATS_LOG_INTERVAL).toFixed(0)}/s`);
     
     this.tradeCount = 0;
     this.lastStatsLog = now;
+  }
+
+  reconnectSymbol(symbol) {
+    const attempts = this.reconnectAttempts.get(symbol) || 0;
     
-    // Cleanup
-    this.tradeAggregator.cleanup();
-    this.cooldownManager.cleanup();
-  }
-
-  startPing() {
-    this.pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.ping();
-      }
-    }, 30000);
-  }
-
-  stopPing() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-  }
-
-  reconnect() {
-    if (this.reconnectAttempts >= this.maxReconnects) {
-      console.error('[WS] Max reconnect attempts reached');
-      process.exit(1);
+    if (attempts >= CONFIG.MAX_RECONNECTS) {
+      console.error(`[WS] ${symbol} max reconnects reached`);
+      return;
     }
 
-    this.reconnectAttempts++;
-    console.log(`[WS] Reconnecting in ${this.reconnectDelay / 1000}s... (attempt ${this.reconnectAttempts})`);
+    this.reconnectAttempts.set(symbol, attempts + 1);
     
     setTimeout(() => {
-      this.connect();
-    }, this.reconnectDelay);
+      console.log(`[WS] ${symbol} reconnecting (${attempts + 1}/${CONFIG.MAX_RECONNECTS})...`);
+      this.connectSymbol(symbol);
+    }, 5000 * (attempts + 1)); // Exponential backoff
   }
 
-  close() {
-    this.stopPing();
-    if (this.ws) {
-      this.ws.close();
+  closeAll() {
+    for (const ws of this.connections.values()) {
+      ws.close();
     }
+    this.connections.clear();
   }
 }
 
@@ -686,82 +430,65 @@ class WebSocketManager {
 class BinanceFuturesFlowBot {
   constructor() {
     this.telegram = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
-    this.symbolManager = new SymbolManager();
     this.tradeAggregator = new TradeAggregator(CONFIG.WINDOW_SECONDS);
     this.signalEngine = new SignalEngine();
     this.cooldownManager = new CooldownManager(CONFIG.COOLDOWN_MINUTES);
     this.alertManager = new AlertManager(this.telegram);
     this.wsManager = null;
-    this.refreshInterval = null;
   }
 
   async start() {
     console.log('='.repeat(70));
     console.log('BINANCE FUTURES AGGRESSIVE FLOW MONITOR');
-    console.log('Real-time detection of forced liquidations via trade flow');
     console.log('='.repeat(70));
-    console.log(`Window: ${CONFIG.WINDOW_SECONDS}s | Min Volume: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M`);
-    console.log(`Min Dominance: ${CONFIG.MIN_DOMINANCE}% | Min Price Δ: ${CONFIG.MIN_PRICE_CHANGE}%`);
-    console.log(`Cooldown: ${CONFIG.COOLDOWN_MINUTES} min | Symbol refresh: ${CONFIG.SYMBOL_REFRESH_HOURS}h`);
+    console.log(`Symbols: ${CONFIG.SYMBOLS.length} | Window: ${CONFIG.WINDOW_SECONDS}s`);
+    console.log(`Min Volume: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M | Dominance: ${CONFIG.MIN_DOMINANCE}%`);
+    console.log(`Price Δ: ${CONFIG.MIN_PRICE_CHANGE}% | Cooldown: ${CONFIG.COOLDOWN_MINUTES}min`);
+    console.log('='.repeat(70));
+    console.log('Monitoring:', CONFIG.SYMBOLS.join(', '));
     console.log('='.repeat(70));
 
     // Test Telegram
     try {
       await this.telegram.sendMessage(
         CONFIG.TELEGRAM_CHAT_ID,
-        '🚀 <b>Binance Futures Flow Monitor Started</b>\n\n✅ Monitoring aggressive trade flow',
+        '🚀 <b>Binance Futures Monitor Started</b>\n\n' +
+        `📊 Watching ${CONFIG.SYMBOLS.length} symbols\n` +
+        `⚡ Signal: $${(CONFIG.MIN_VOLUME_USD / 1e6).toFixed(1)}M | ${CONFIG.MIN_DOMINANCE}% | ${CONFIG.MIN_PRICE_CHANGE}%`,
         { parse_mode: 'HTML' }
       );
-      console.log('[TELEGRAM] Connection OK\n');
+      console.log('[TELEGRAM] ✅ Connected\n');
     } catch (error) {
-      console.error('[TELEGRAM] Error:', error.message);
+      console.error('[TELEGRAM] ❌ Error:', error.message);
       process.exit(1);
     }
 
-    // Initialize symbols
-    await this.symbolManager.initialize();
-
-    // Connect WebSocket
-    this.wsManager = new WebSocketManager(
-      this.symbolManager,
+    // Connect WebSockets
+    this.wsManager = new MultiWebSocketManager(
+      CONFIG.SYMBOLS,
       this.tradeAggregator,
       this.signalEngine,
       this.cooldownManager,
       this.alertManager
     );
     
-    this.wsManager.connect();
-
-    // Periodic symbol refresh
-    this.startSymbolRefresh();
+    this.wsManager.connectAll();
 
     // Graceful shutdown
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
   }
 
-  startSymbolRefresh() {
-    this.refreshInterval = setInterval(async () => {
-      console.log('\n[REFRESH] Updating symbol list...');
-      await this.symbolManager.initialize();
-    }, CONFIG.SYMBOL_REFRESH_HOURS * 60 * 60 * 1000);
-  }
-
   async shutdown() {
-    console.log('\n[SHUTDOWN] Stopping bot...');
-    
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
-    }
+    console.log('\n[SHUTDOWN] Stopping...');
     
     if (this.wsManager) {
-      this.wsManager.close();
+      this.wsManager.closeAll();
     }
     
     await this.telegram.sendMessage(
       CONFIG.TELEGRAM_CHAT_ID,
-      '⛔ Binance Futures Flow Monitor Stopped',
-      { parse_mode: 'HTML' }
+      '⛔ Binance Futures Monitor Stopped'
     );
     
     process.exit(0);
