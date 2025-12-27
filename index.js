@@ -72,7 +72,10 @@ class SymbolManager {
     
     try {
       const response = await axios.get(`${CONFIG.BINANCE_API}/fapi/v1/ticker/24hr`, {
-        timeout: 10000
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
       });
 
       let count = 0;
